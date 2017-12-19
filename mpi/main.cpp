@@ -9,19 +9,25 @@
 #include <sstream>
 #include <mpi.h>
 
+#include <unistd.h>
+
+#define N_COLUNAS 59
+
 using namespace std;
 
-typedef struct classificacao{
+struct Classificacao{
     float distancia;
     string classe;
 
-    bool operator<(const classificacao& c) const {
+    bool operator<(const Classificacao& c) const {
         return distancia > c.distancia;
     }
-} Classificacao;
+
+    Classificacao() : distancia(0), classe("") {}
+};
 
 typedef struct {
-    vector<double> valor;
+    array<double, N_COLUNAS> valor;
     string classe;
 } Linha;
 
@@ -35,8 +41,11 @@ vector<Linha> *fazer(ifstream &file){
         stringstream strA(linha);
 
         Linha l;
-        while (getline(strA, valor, ','))
-			l.valor.push_back(atof(valor.c_str()));
+        int pos = 0;
+        while (getline(strA, valor, ',') && pos < N_COLUNAS) {
+            l.valor[pos] = atof(valor.c_str());
+            pos++;
+        }
         l.classe = valor;
 
         a->push_back(l);
@@ -45,30 +54,22 @@ vector<Linha> *fazer(ifstream &file){
     return a;
 }
 
-void classificar(vector<Linha> X, vector<Linha> B, int rank, int size){
-    int linhas = 0;    
+void classificar(Linha x, vector<Linha> *B) {
 
-    for(vector<Linha>::iterator itX = X.begin()+rank; itX < X.end(); itX+=size) {
+    vector<Classificacao> ks;
+    ks.resize(B->size());
 
-        vector<Classificacao> ks;
-        ks.resize(10);
+    Classificacao *pos = &ks[0];
 
-        for(vector<Linha>::iterator itB = B.begin(); itB < B.end(); itB++) {
+    for (const auto &linha : *B) {
+        pos->classe = linha.classe;
 
-            Classificacao c;
-            c.distancia = 0;
-            c.classe = itB->classe;
+        for (int i = 0; i < linha.valor.size(); ++i)
+            pos->distancia += abs((x.valor.at(i) - linha.valor.at(i)));
 
-            for (int i = 0; i < itB->valor.size(); ++i)
-                c.distancia += abs((itX->valor.at(i) - itB->valor.at(i)));
-
-            ks.push_back(c);
-            sort(ks.begin(), ks.end());
-            ks.pop_back();
-        }
-        linhas++;
+        pos += sizeof(Classificacao);
     }
-    cout << "Processo[" << rank << "] leu " << linhas << "linhas" << endl;
+    sort(ks.begin(), ks.end());
 }
 
 int main(int argc, char** argv) {
@@ -79,50 +80,64 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    string nomeArqB = "train_59.data",
-           nomeArqX = "test_59.data";
-    ifstream arqB, arqX;
+    int status_fim = 0;
 
-    arqB.open(nomeArqB);
-    arqX.open(nomeArqX);
+    if (rank == 0) {
+        string nomeArqB = "train_59.data",
+               nomeArqX = "test_59.data";
+        ifstream arqB, arqX;
 
-    if(!arqB.is_open() || !arqX.is_open()){
-        MPI_Finalize();
-        return 0;
+        arqB.open(nomeArqB);
+        arqX.open(nomeArqX);
+
+        if(!arqB.is_open() || !arqX.is_open()){
+            MPI_Finalize();
+            return 0;
+        }
+
+        vector<Linha> *B = fazer(arqB),
+            *X = fazer(arqX);
+
+        int BSize = ceil((float)B->size()/size);
+
+        for (int i = 1; i < size; i++)
+            MPI_Send(&BSize, 1, MPI_INT, i, 0, MPI_COMM_WORLD);
+
+        MPI_Scatter(&B->front(), BSize * sizeof(Linha), MPI_BYTE, &B->front(), BSize * sizeof(Linha), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        for (const auto &linha : *X) {
+            for (int i = 1; i < size; i++)
+                MPI_Send(&status_fim, 1, MPI_INT, i, 0, MPI_COMM_WORLD);
+            for (int i = 1; i < size; i++)
+                MPI_Send(&linha, sizeof(linha), MPI_BYTE, i, 0, MPI_COMM_WORLD);
+        }
+        status_fim = 1;
+
+        for (int i = 1; i < size; i++)
+            MPI_Send(&status_fim, 1, MPI_INT, i, 0, MPI_COMM_WORLD);
+
+        arqB.close();
+        arqX.close();
+    }
+    else {
+        int BSize;
+        MPI_Recv(&BSize, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        vector<Linha> B;
+        B.resize(BSize);
+
+        MPI_Scatter(&B.front(), BSize * sizeof(Linha), MPI_BYTE, &B.front(), BSize * sizeof(Linha), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        Linha linha;
+
+        MPI_Recv(&status_fim, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        while(!status_fim) {
+            MPI_Recv(&linha, sizeof(linha), MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            classificar(linha, &B);
+            MPI_Recv(&status_fim, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
     }
 
-    vector<Linha> *B = fazer(arqB),
-                  *X = fazer(arqX);
-
-    MPI_Status st;
-
-    int x[size],
-        tam = X->size() / (size-1),
-        resto = X->size() % (size-1);
-    for (int i = 1; i < size; ++i) {
-        if (resto > 0){
-            x[i] = tam + resto;
-            resto--;
-        } else 
-            x[i] = tam;
-    }
-    printf("%d dividido em %d é igual a %d com resto %d\n", X->size(), size-1, tam, resto);
-
-    long int tamByteSize = X->size() * sizeof(Linha);
-    printf("tamanho estimado: %ld", tamByteSize);
-
-    if(rank == 0){
-	for (int i = 1; i < size; i++){
-            MPI_Send(&X[0], tamByteSize, MPI_BYTE, i, 0, MPI_COMM_WORLD);
-//	    printf("processo %d enviou %d\n", rank, i);
-	}
-    }else{
-	MPI_Recv(&X[0], tamByteSize, MPI_BYTE, 0, 0, MPI_COMM_WORLD, &st);
-//	printf("processo %d recebeu %d\n", rank, val);
-    }
-
-    arqB.close();
-    arqX.close();
 
     MPI_Finalize();
     return 0;
